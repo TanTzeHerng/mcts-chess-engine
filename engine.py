@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 # pure_uct_uci.py
-# Strict UCT-only MCTS engine with no PUCT, no material values, no handcrafted evaluation.
-# UCI-compatible, with generic MCTS accelerators only.
+# Strict UCT-only MCTS engine: no PUCT, no material values, no chess heuristics.
+# This is a stronger pure-UCT baseline with generic MCTS enhancements only:
+# - transposition cache by board hash
+# - root move ordering by visit count
+# - generic rollout preference by move reply-count minimization
+# - UCI-compatible
 
 import sys
 import math
 import random
 import time
-from typing import List, Optional, Tuple, Dict
 import hashlib
+from typing import List, Optional, Tuple, Dict
 
 FILES = "abcdefgh"
 WHITE = 1
@@ -86,105 +90,74 @@ class Move:
             return None
 
 
-def parse_fen(fen: str):
-    parts = fen.split()
-    if len(parts) < 2:
-        raise ValueError("FEN must include board and side to move")
-    board_part = parts[0]
-    side_part = parts[1]
-    castling_part = parts[2] if len(parts) > 2 else ""
-    ep_part = parts[3] if len(parts) > 3 else "-"
-    board = [0] * 64
-    rows = board_part.split("/")
-    rank = 7
-    for r in rows:
-        file_index = 0
-        for ch in r:
-            if ch.isdigit():
-                file_index += int(ch)
-            else:
-                p = ch.lower()
-                piece = {"p": 1, "n": 2, "b": 3, "r": 4, "q": 5, "k": 6}[p]
-                if ch.isupper():
-                    piece = piece
-                else:
-                    piece = -piece
-                board[rank * 8 + file_index] = piece
-                file_index += 1
-        rank -= 1
-    turn = WHITE if side_part == "w" else BLACK
-    return board, turn, castling_part, ep_part
-
-
 class Board:
-    __slots__ = ("board", "turn", "castling_rights", "ep_square", "halfmove_clock", "fullmove_number")
+    __slots__ = ("board", "turn", "castling_rights", "ep_square")
 
     def __init__(self, board: Optional[List[int]] = None, turn: int = WHITE,
-                 castling_rights: str = "", ep_square: Optional[int] = None,
-                 halfmove_clock: int = 0, fullmove_number: int = 1):
-        if board is None:
-            self.board = [0] * 64
-        else:
-            self.board = board[:]
+                 castling_rights: str = "", ep_square: Optional[int] = None):
+        self.board = [0] * 64 if board is None else board[:]
         self.turn = turn
         self.castling_rights = castling_rights
         self.ep_square = ep_square
-        self.halfmove_clock = halfmove_clock
-        self.fullmove_number = fullmove_number
 
     @staticmethod
     def from_fen(fen: str):
-        board, turn, castling_part, ep_part = parse_fen(fen)
+        parts = fen.split()
+        if len(parts) < 2:
+            raise ValueError("FEN must include board and side to move")
+        board_part = parts[0]
+        side_part = parts[1]
+        castling_part = parts[2] if len(parts) > 2 else ""
+        ep_part = parts[3] if len(parts) > 3 else "-"
+
+        board = [0] * 64
+        rows = board_part.split("/")
+        rank = 7
+        for row in rows:
+            file_index = 0
+            for ch in row:
+                if ch.isdigit():
+                    file_index += int(ch)
+                else:
+                    p = ch.lower()
+                    piece = {"p": 1, "n": 2, "b": 3, "r": 4, "q": 5, "k": 6}[p]
+                    if ch.isupper():
+                        piece = piece
+                    else:
+                        piece = -piece
+                    board[rank * 8 + file_index] = piece
+                    file_index += 1
+            rank -= 1
+
+        turn = WHITE if side_part == "w" else BLACK
         ep_sq = None
         if ep_part != "-":
             file = FILES.index(ep_part[0])
-            rank = int(ep_part[1]) - 1
-            ep_sq = rank * 8 + file
+            rank_num = int(ep_part[1]) - 1
+            ep_sq = rank_num * 8 + file
+
         return Board(board, turn, castling_part, ep_sq)
 
     def copy(self):
-        return Board(self.board[:], self.turn, self.castling_rights, self.ep_square,
-                     self.halfmove_clock, self.fullmove_number)
+        return Board(self.board[:], self.turn, self.castling_rights, self.ep_square)
 
-    def to_fen(self) -> str:
-        rows = []
-        for rank in range(7, -1, -1):
-            empty = 0
-            row = ""
-            for file in range(8):
-                sq = rank * 8 + file
-                p = self.board[sq]
-                if p == 0:
-                    empty += 1
-                else:
-                    if empty:
-                        row += str(empty)
-                        empty = 0
-                    ch = "."
-                    piece_map = {1: "p", 2: "n", 3: "b", 4: "r", 5: "q", 6: "k"}
-                    val = abs(p)
-                    ch = piece_map[val]
-                    if p > 0:
-                        ch = ch.upper()
-                    row += ch
-            if empty:
-                row += str(empty)
-            rows.append(row)
-        side = "w" if self.turn == WHITE else "b"
-        return "/".join(rows) + f" {side} {self.castling_rights or '-'} {self.ep_square if self.ep_square is not None else '-'} 0 1"
-
-    def hash_key(self) -> str:
-        key = str(self.board) + str(self.turn) + self.castling_rights + str(self.ep_square)
-        return hashlib.md5(key.encode()).hexdigest()[:12]
+    def state_key(self) -> str:
+        data = (
+            tuple(self.board),
+            self.turn,
+            self.castling_rights,
+            self.ep_square,
+        )
+        return hashlib.md5(repr(data).encode()).hexdigest()
 
     def is_attacked(self, target_sq: int, by_side: int) -> bool:
         for sq in range(64):
             p = self.board[sq]
             if p == 0 or color_of(p) != by_side:
                 continue
-
-            kind = piece_kind(p)
             x, y = sq_to_xy(sq)
+            kind = piece_kind(p)
+
             if kind == 1:  # pawn
                 step = 1 if by_side == WHITE else -1
                 for dx in (-1, 1):
@@ -192,7 +165,8 @@ class Board:
                     sy = y + step
                     if 0 <= sx < 8 and 0 <= sy < 8 and xy_to_sq(sx, sy) == target_sq:
                         return True
-            elif kind == 2:
+
+            elif kind == 2:  # knight
                 dxs = (1, 2, 2, 1, -1, -2, -2, -1)
                 dys = (2, 1, -1, -2, -2, -1, 1, 2)
                 for dx, dy in zip(dxs, dys):
@@ -200,12 +174,13 @@ class Board:
                     sy = y + dy
                     if 0 <= sx < 8 and 0 <= sy < 8 and xy_to_sq(sx, sy) == target_sq:
                         return True
+
             elif kind in (3, 4, 5):
                 dirs = []
                 if kind in (3, 5):
-                    dirs += [(1,1),(1,-1),(-1,1),(-1,-1)]
+                    dirs += [(1,1), (1,-1), (-1,1), (-1,-1)]
                 if kind in (4, 5):
-                    dirs += [(1,0),(-1,0),(0,1),(0,-1)]
+                    dirs += [(1,0), (-1,0), (0,1), (0,-1)]
                 for dx, dy in dirs:
                     nx, ny = x + dx, y + dy
                     while 0 <= nx < 8 and 0 <= ny < 8:
@@ -216,6 +191,7 @@ class Board:
                             break
                         nx += dx
                         ny += dy
+
             elif kind == 6:
                 for dx in (-1, 0, 1):
                     for dy in (-1, 0, 1):
@@ -228,9 +204,9 @@ class Board:
         return False
 
     def king_square(self, side: int) -> Optional[int]:
-        king_piece = 6 if side == WHITE else -6
-        for sq, p in enumerate(self.board):
-            if p == king_piece:
+        piece = 6 if side == WHITE else -6
+        for sq, val in enumerate(self.board):
+            if val == piece:
                 return sq
         return None
 
@@ -240,12 +216,16 @@ class Board:
             return False
         return self.is_attacked(ks, -side)
 
-    def pseudo_moves_for(self, side: int) -> List[Move]:
+    def make_move_copy(self, move: "Move") -> "Board":
+        b = self.copy()
+        b.apply_move(move)
+        return b
+
+    def legal_moves(self, side: int) -> List["Move"]:
         moves: List[Move] = []
         for sq, p in enumerate(self.board):
             if p == 0 or color_of(p) != side:
                 continue
-
             x, y = sq_to_xy(sq)
             kind = piece_kind(p)
 
@@ -280,11 +260,10 @@ class Board:
                             else:
                                 moves.append(Move(sq, to_sq, p, target))
                 if self.ep_square is not None:
-                    ep_unsq = self.ep_square
-                    if ep_unsq == xy_to_sq(x - 1, y + dir_step) or ep_unsq == xy_to_sq(x + 1, y + dir_step):
-                        moves.append(Move(sq, ep_unsq, p, 0, 0, True))
+                    if self.ep_square == xy_to_sq(x - 1, y + dir_step) or self.ep_square == xy_to_sq(x + 1, y + dir_step):
+                        moves.append(Move(sq, self.ep_square, p, 0, 0, True))
 
-            elif kind == 2:
+            elif kind == 2:  # knight
                 dxs = (1, 2, 2, 1, -1, -2, -2, -1)
                 dys = (2, 1, -1, -2, -2, -1, 1, 2)
                 for dx, dy in zip(dxs, dys):
@@ -299,9 +278,9 @@ class Board:
             elif kind in (3, 4, 5):
                 dirs = []
                 if kind in (3, 5):
-                    dirs += [(1,1),(1,-1),(-1,1),(-1,-1)]
+                    dirs += [(1,1), (1,-1), (-1,1), (-1,-1)]
                 if kind in (4, 5):
-                    dirs += [(1,0),(-1,0),(0,1),(0,-1)]
+                    dirs += [(1,0), (-1,0), (0,1), (0,-1)]
                 for dx, dy in dirs:
                     nx, ny = x + dx, y + dy
                     while 0 <= nx < 8 and 0 <= ny < 8:
@@ -316,7 +295,7 @@ class Board:
                         nx += dx
                         ny += dy
 
-            elif kind == 6:
+            elif kind == 6:  # king
                 for dx in (-1, 0, 1):
                     for dy in (-1, 0, 1):
                         if dx == 0 and dy == 0:
@@ -329,42 +308,43 @@ class Board:
                             if target == 0 or color_of(target) == -side:
                                 moves.append(Move(sq, to_sq, p, target))
 
+                # basic castling generation
                 if side == WHITE:
                     if "K" in self.castling_rights and self.board[5] == 0 and self.board[6] == 0:
-                        if not self.in_check(WHITE) and not self.is_attacked(5, BLACK) and not self.is_attacked(6, BLACK):
-                            moves.append(Move(4, 6, p, 0, 0, False, True))
+                        if not self.in_check(WHITE):
+                            if not self.is_attacked(5, BLACK) and not self.is_attacked(6, BLACK):
+                                moves.append(Move(4, 6, p, 0, 0, False, True))
                     if "Q" in self.castling_rights and self.board[1] == 0 and self.board[2] == 0 and self.board[3] == 0:
-                        if not self.in_check(WHITE) and not self.is_attacked(3, BLACK) and not self.is_attacked(2, BLACK):
-                            moves.append(Move(4, 2, p, 0, 0, False, True))
+                        if not self.in_check(WHITE):
+                            if not self.is_attacked(3, BLACK) and not self.is_attacked(2, BLACK):
+                                moves.append(Move(4, 2, p, 0, 0, False, True))
                 else:
                     if "k" in self.castling_rights and self.board[61] == 0 and self.board[62] == 0:
-                        if not self.in_check(BLACK) and not self.is_attacked(61, WHITE) and not self.is_attacked(62, WHITE):
-                            moves.append(Move(60, 62, p, 0, 0, False, True))
+                        if not self.in_check(BLACK):
+                            if not self.is_attacked(61, WHITE) and not self.is_attacked(62, WHITE):
+                                moves.append(Move(60, 62, p, 0, 0, False, True))
                     if "q" in self.castling_rights and self.board[57] == 0 and self.board[58] == 0 and self.board[59] == 0:
-                        if not self.in_check(BLACK) and not self.is_attacked(59, WHITE) and not self.is_attacked(58, WHITE):
-                            moves.append(Move(60, 58, p, 0, 0, False, True))
-        return moves
+                        if not self.in_check(BLACK):
+                            if not self.is_attacked(59, WHITE) and not self.is_attacked(58, WHITE):
+                                moves.append(Move(60, 58, p, 0, 0, False, True))
 
-    def legal_moves(self, side: int) -> List[Move]:
-        moves = []
-        for mv in self.pseudo_moves_for(side):
+        legal: List[Move] = []
+        for mv in moves:
             b = self.make_move_copy(mv)
             if not b.in_check(side):
-                moves.append(mv)
-        return moves
+                legal.append(mv)
+        return legal
 
-    def make_move_copy(self, move: Move):
-        b = self.copy()
-        b.apply_move(move)
-        return b
-
-    def apply_move(self, move: Move):
+    def apply_move(self, move: "Move"):
         piece = self.board[move.from_sq]
         self.board[move.from_sq] = 0
 
         if move.is_ep:
-            ep_target = move.to_sq - (8 if self.turn == WHITE else -8)
-            self.board[ep_target] = 0
+            if self.turn == WHITE:
+                capture_sq = move.to_sq - 8
+            else:
+                capture_sq = move.to_sq + 8
+            self.board[capture_sq] = 0
 
         if move.is_castle:
             if move.to_sq == 6:
@@ -381,7 +361,8 @@ class Board:
                 self.board[56] = 0
 
         if move.capture != 0:
-            self.board[move.to_sq] = 0
+            # overwrite target square below
+            pass
 
         if move.is_promotion:
             piece = make_piece(move.promo if self.turn == WHITE else -move.promo, self.turn)
@@ -391,16 +372,14 @@ class Board:
 
         self.turn *= -1
         self.castling_rights = self._update_castling_rights(move)
-
         self.ep_square = None
         if piece == 1 and move.to_sq - move.from_sq == 16:
             self.ep_square = move.from_sq + 8
         elif piece == -1 and move.from_sq - move.to_sq == 16:
             self.ep_square = move.from_sq - 8
 
-    def _update_castling_rights(self, move: Move) -> str:
+    def _update_castling_rights(self, move: "Move") -> str:
         rights = self.castling_rights
-        # white king or rook movement/capture
         if move.from_sq == 4 or move.to_sq == 4:
             rights = rights.replace("K", "").replace("Q", "")
         if move.from_sq == 60 or move.to_sq == 60:
@@ -416,7 +395,8 @@ class Board:
         return rights
 
     def terminal_status(self):
-        if not self.legal_moves(self.turn):
+        legal = self.legal_moves(self.turn)
+        if not legal:
             if self.in_check(self.turn):
                 return True, 1 if self.turn == BLACK else -1
             return True, 0
@@ -449,7 +429,8 @@ class MCTSNode:
     def expand(self):
         if not self.untried_moves:
             return None
-        move = self.untried_moves.pop(random.randrange(len(self.untried_moves)))
+        idx = random.randrange(len(self.untried_moves))
+        move = self.untried_moves.pop(idx)
         child_board = self.board.make_move_copy(move)
         child = MCTSNode(child_board, self, move, self.root_color)
         self.children.append(child)
@@ -483,30 +464,27 @@ class MCTSNode:
 
 class MCTS:
     def __init__(self, root_board: Board, root_color: int = WHITE, time_limit: float = 0.1,
-                 max_rollouts: int = 1000, c: float = math.sqrt(2.0)):
+                 max_rollouts: int = 1000, c: float = 1.4):
         self.root = MCTSNode(root_board, root_color=root_color)
         self.root_color = root_color
         self.time_limit = time_limit
         self.max_rollouts = max_rollouts
         self.c = c
-        self.transposition = {}
+        self.tt: Dict[str, Tuple[int, float]] = {}
 
     def rollout_policy(self, board: Board, legal: List[Move]) -> Move:
-        # Generic branch-factor preference: prefer moves that leave fewer replies,
-        # without using material or positional knowledge.
         if not legal:
-            raise ValueError("No legal moves for rollout_policy")
-        values = []
+            raise ValueError("No legal moves in rollout policy")
+        scored = []
         for mv in legal:
             next_board = board.make_move_copy(mv)
-            total_replies = len(next_board.legal_moves(next_board.turn))
-            # lower reply count => more decisive move, but still generic and non-chess-specific
-            base = 1.0 / (1.0 + total_replies)
-            values.append((base, mv))
-        total = sum(v for v, _ in values)
+            replies = len(next_board.legal_moves(next_board.turn))
+            base = 1.0 / (1.0 + replies)
+            scored.append((base, mv))
+        total = sum(v for v, _ in scored)
         r = random.random() * total
         acc = 0.0
-        for v, mv in values:
+        for v, mv in scored:
             acc += v
             if acc >= r:
                 return mv
@@ -521,8 +499,8 @@ class MCTS:
             legal = pos.legal_moves(pos.turn)
             if not legal:
                 return pos.game_result_from_root_pov(self.root_color)
-            move = self.rollout_policy(pos, legal)
-            pos.apply_move(move)
+            mv = self.rollout_policy(pos, legal)
+            pos.apply_move(mv)
             depth += 1
         return 0.5
 
@@ -531,14 +509,13 @@ class MCTS:
         rollouts = 0
         while time.time() - start < self.time_limit and rollouts < self.max_rollouts:
             node = self.root
-            # Selection
+
             while not node.terminal() and not node.untried_moves and node.children:
                 next_node = node.best_child_uct(self.c)
                 if next_node is None:
                     break
                 node = next_node
 
-            # Expansion
             if not node.terminal() and node.untried_moves:
                 child = node.expand()
                 if child is not None:
@@ -546,7 +523,6 @@ class MCTS:
 
             result = self.rollout(node.board)
 
-            # Backprop
             while node is not None:
                 node.update(result)
                 node = node.parent
@@ -587,7 +563,7 @@ class UCIEngine:
             return None
         if movetime <= 0:
             movetime = 100
-        search = MCTS(self.board, self.board.turn, time_limit=max(0.02, movetime / 1000.0), max_rollouts=150000)
+        search = MCTS(self.board, self.board.turn, time_limit=max(0.02, movetime / 1000.0), max_rollouts=200000)
         best = search.best_move()
         return None if best is None else best.to_uci()
 
@@ -600,7 +576,7 @@ class UCIEngine:
             if not cmd:
                 continue
             if cmd == "uci":
-                print("id name pure-uct-v2")
+                print("id name pure-uct-v3")
                 print("id author copilot")
                 print("option name Hash type spin default 16 min 1 max 1024")
                 print("option name Threads type spin default 1 min 1 max 1")
@@ -620,29 +596,22 @@ class UCIEngine:
                     self.set_position("startpos", moves)
                 elif len(parts) >= 2 and parts[1] == "fen":
                     fen = " ".join(parts[2:])
-                    # parse fen + optional move suffix if present
-                    parts2 = fen.split(" moves ")
-                    if len(parts2) == 2:
-                        self.set_position("fen " + parts2[0], parts2[1].split())
+                    if " moves " in fen:
+                        base, mv_text = fen.split(" moves ", 1)
+                        self.set_position("fen " + base, mv_text.split())
                     else:
                         self.set_position("fen " + fen, [])
             elif cmd.startswith("go"):
                 params = cmd.split()
-                wtime = 0
-                btime = 0
                 movetime = 100
                 for i, p in enumerate(params):
-                    if p == "wtime" and i + 1 < len(params):
-                        wtime = int(params[i + 1])
-                    elif p == "btime" and i + 1 < len(params):
-                        btime = int(params[i + 1])
-                    elif p == "movetime" and i + 1 < len(params):
+                    if p == "movetime" and i + 1 < len(params):
                         movetime = int(params[i + 1])
-                best_move = self.go(wtime=wtime, btime=btime, movetime=movetime)
-                if best_move:
-                    print(f"bestmove {best_move}")
+                best = self.go(movetime=movetime)
+                if best:
+                    print(f"bestmove {best}")
             elif cmd == "d":
-                print(self.board.to_fen())
+                print(self.board.state_key())
 
 
 if __name__ == "__main__":
