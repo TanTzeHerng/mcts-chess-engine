@@ -1,0 +1,1 @@
+# Pure Python chess engine - no external dependencies beyond standard library
