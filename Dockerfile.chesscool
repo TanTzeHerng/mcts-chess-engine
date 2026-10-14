@@ -1,0 +1,30 @@
+FROM mcr.microsoft.com/playwright/python:v1.55.0-jammy
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git build-essential ninja-build meson pkg-config curl ca-certificates \
+    libdnnl-dev libprotobuf-dev protobuf-compiler zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 --branch v0.32.1 https://github.com/LeelaChessZero/lc0.git /opt/lc0 \
+    && cd /opt/lc0 \
+    && ./build.sh -Dnative_arch=false -Ddnnl=true
+
+RUN mkdir -p /opt/elite-extract \
+    && curl -L --retry 4 --fail \
+       https://github.com/JohanSjoblom/picochess/releases/download/v4.2.0/lc0_weights.tar.gz \
+       | tar -xz -C /opt/elite-extract --wildcards --no-anchored 'elite_v2.pb.gz' \
+    && ELITE="$(find /opt/elite-extract -type f -name elite_v2.pb.gz | head -n 1)" \
+    && test -n "$ELITE" \
+    && cp "$ELITE" /opt/elite_v2.pb.gz \
+    && test -s /opt/elite_v2.pb.gz \
+    && rm -rf /opt/elite-extract
+
+RUN pip install --no-cache-dir fastapi uvicorn python-chess playwright==1.55.0
+
+WORKDIR /app
+COPY chesscool_worker.py /app/chesscool_worker.py
+
+CMD ["sh", "-c", "uvicorn chesscool_worker:app --host 0.0.0.0 --port ${PORT:-10000}"]
