@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright/python:v1.55.0-jammy
+FROM python:3.12-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -22,7 +22,7 @@ RUN mkdir -p /opt/elite-extract \
     && test -s /opt/elite_v2.pb.gz \
     && rm -rf /opt/elite-extract
 
-RUN pip install --no-cache-dir fastapi uvicorn python-chess playwright==1.55.0
+RUN pip install --no-cache-dir fastapi uvicorn
 
 WORKDIR /app
 COPY chesscool_worker.py /app/chesscool_worker.py
